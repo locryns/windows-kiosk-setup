@@ -12,8 +12,13 @@ Wi-Fi) pointant sur `https://fdm.awbb.be`.
 
 - **Auto-login** sur un compte standard dédié (sans saisie de mot de passe au
   démarrage).
-- **Edge en mode kiosk fullscreen** (`--kiosk --edge-kiosk-type=fullscreen`) sur
-  l'URL cible.
+- **Edge en mode `--app=URL --start-fullscreen`** : fenêtre PWA sans barre
+  d'URL, profil **persistant** (mots de passe sauvegardés et cookies conservés).
+  On n'utilise **pas** `--kiosk --edge-kiosk-type=fullscreen` car ce mode force
+  une session **InPrivate** -- autofill désactivé, rien n'est conservé entre
+  redémarrages. Le confinement URL passe par policies (ci-dessous).
+- **URL sandbox** : `URLBlocklist=['*']` + `URLAllowlist` sur l'hôte kiosk et
+  `*.{domaine-apex}` (ex. `*.awbb.be`) + `NewWindowsInApp=1`.
 - **Watchdog** : si Edge ferme, il est relancé dans les 10 secondes.
 - **Verrouillage clavier** : Win, context menu, Task Manager, Registry Editor,
   CMD interactif, centre de notifications, lock screen.
@@ -105,11 +110,19 @@ Start-Process "C:\Kiosk\watchdog.bat"
 
 ## Pièges rencontrés (gagnez 3 h de debug)
 
+- **`--kiosk` force InPrivate** : d'après la [doc officielle Edge][msdoc],
+  `--kiosk --edge-kiosk-type=fullscreen` (Digital Signage) **et**
+  `--edge-kiosk-type=public-browsing` démarrent une **session InPrivate**.
+  Conséquences : autofill désactivé, cookies/mots de passe non persistés
+  entre redémarrages, impossible d'utiliser les credentials sauvegardés.
+  Fix : basculer en `--app=URL --start-fullscreen` (profil persistant, fenêtre
+  chromeless) et confiner les URLs via `URLAllowlist`/`URLBlocklist`.
 - **Edge startup boost** : `--win-session-start --no-startup-window` pré-charge
   Edge avant que le launcher ne s'exécute. La nouvelle instance lancée avec
-  `--kiosk` rejoint alors la session pré-existante **en mode fenêtré**. Fix :
-  policies `StartupBoostEnabled=0` + `BackgroundModeEnabled=0` (appliquées par
-  `setup-kiosk.ps1`) et kill loop agressif dans `launch-kiosk.bat`.
+  `--app=` rejoint alors la session pré-existante **dans une fenêtre normale
+  avec barre d'URL**. Fix : policies `StartupBoostEnabled=0` +
+  `BackgroundModeEnabled=0` (appliquées par `setup-kiosk.ps1`) et kill loop
+  agressif dans `launch-kiosk.bat`.
 - **Raccourci PWA Edge** : `Install site as app` crée un `.lnk` dans le dossier
   Startup qui lance Edge `--app-id=... --app-url=...` — même effet que ci-dessus.
   Le setup les nettoie automatiquement.
@@ -123,6 +136,8 @@ Start-Process "C:\Kiosk\watchdog.bat"
   Ne jamais forcer un reset si les mots de passe Edge sont utiles.
 - **Windows 11 Home** : pas de GPO, pas d'Assigned Access, pas de Shell Launcher.
   Tout passe par registre utilisateur + startup shortcuts.
+
+[msdoc]: https://learn.microsoft.com/en-us/deployedge/microsoft-edge-configure-kiosk-mode
 
 ## Licence
 

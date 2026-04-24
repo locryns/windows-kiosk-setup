@@ -54,9 +54,15 @@ if (!(Test-Path $launcherDir)) { New-Item -ItemType Directory -Path $launcherDir
 
 # Robust launcher: kill all msedge instances and wait until the
 # process is fully gone before launching kiosk. This prevents the
-# new kiosk window from "joining" an already-running Edge session
-# started by --win-session-start / startup boost, which silently
-# drops the --kiosk flag.
+# new Edge window from "joining" an already-running session started
+# by --win-session-start / startup boost, which silently drops our
+# launcher flags.
+#
+# Uses Edge --app= mode (PWA window, persistent profile) instead of
+# --kiosk because the latter forces an InPrivate session that disables
+# autofill and loses saved passwords/cookies across restarts.
+# URL sandboxing is enforced at the policy layer (URLAllowlist /
+# URLBlocklist below), not through --kiosk.
 $launcherContent = @"
 @echo off
 REM Edge Kiosk Launcher for BC Silly
@@ -76,19 +82,19 @@ if "%ERRORLEVEL%"=="0" (
 REM Extra safety wait so the previous Edge user-data-dir locks release
 timeout /t 3 /nobreak >nul
 
-start "" "$EdgePath" --kiosk "$KioskURL" --edge-kiosk-type=fullscreen ^
+start "" "$EdgePath" --app="$KioskURL" ^
+    --start-fullscreen ^
     --no-first-run ^
     --disable-features=msEdgeSidebarV2,msEdgeJSONViewer,msEdgeSplitWindow ^
     --disable-popup-blocking ^
     --disable-infobars ^
     --disable-session-crashed-bubble ^
-    --noerrdialogs ^
-    --start-fullscreen
+    --noerrdialogs
 "@
 Set-Content -Path "$launcherDir\launch-kiosk.bat" -Value $launcherContent -Encoding ASCII
 Write-Output "Created $launcherDir\launch-kiosk.bat"
 
-# Watchdog: if Edge dies, relaunch kiosk mode.
+# Watchdog: if Edge dies, relaunch app mode.
 $watchdogContent = @"
 @echo off
 REM Edge Kiosk Watchdog - restarts Edge if it closes
@@ -96,14 +102,14 @@ REM Edge Kiosk Watchdog - restarts Edge if it closes
 timeout /t 10 /nobreak >nul
 tasklist /FI "IMAGENAME eq msedge.exe" 2>NUL | find /I /N "msedge.exe" >nul
 if "%ERRORLEVEL%"=="1" (
-    start "" "$EdgePath" --kiosk "$KioskURL" --edge-kiosk-type=fullscreen ^
+    start "" "$EdgePath" --app="$KioskURL" ^
+        --start-fullscreen ^
         --no-first-run ^
         --disable-features=msEdgeSidebarV2,msEdgeJSONViewer,msEdgeSplitWindow ^
         --disable-popup-blocking ^
         --disable-infobars ^
         --disable-session-crashed-bubble ^
-        --noerrdialogs ^
-        --start-fullscreen
+        --noerrdialogs
 )
 goto loop
 "@
@@ -229,7 +235,7 @@ Write-Output "Disabled Windows Update auto-restart"
 # Edge policies (HKLM - apply to all users)
 # Critical: StartupBoostEnabled=0 and BackgroundModeEnabled=0 prevent Edge
 # from pre-warming with --win-session-start which would later swallow our
-# --kiosk flag. BrowserSignin=0 avoids account prompts.
+# launcher flags. BrowserSignin=0 avoids account prompts.
 $edgePolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
 if (!(Test-Path $edgePolicyPath)) { New-Item -Path $edgePolicyPath -Force | Out-Null }
 Set-ItemProperty -Path $edgePolicyPath -Name "HideFirstRunExperience" -Value 1 -Type DWord
@@ -237,7 +243,38 @@ Set-ItemProperty -Path $edgePolicyPath -Name "AutoImportAtFirstRun" -Value 4 -Ty
 Set-ItemProperty -Path $edgePolicyPath -Name "StartupBoostEnabled" -Value 0 -Type DWord
 Set-ItemProperty -Path $edgePolicyPath -Name "BackgroundModeEnabled" -Value 0 -Type DWord
 Set-ItemProperty -Path $edgePolicyPath -Name "BrowserSignin" -Value 0 -Type DWord
-Write-Output "Applied Edge kiosk policies (StartupBoost/Background/Signin off)"
+# Keep subframes / new windows inside the app window instead of spawning
+# a full Edge browser window with a URL bar (would break the lockdown).
+Set-ItemProperty -Path $edgePolicyPath -Name "NewWindowsInApp" -Value 1 -Type DWord
+Write-Output "Applied Edge policies (StartupBoost/Background/Signin off, NewWindowsInApp)"
+
+# URL sandboxing: block everything except the kiosk site + same domain.
+# Since we no longer use --kiosk InPrivate, this is the main containment.
+# Policy format: subkey with numbered REG_SZ values (1,2,3...).
+#
+# Derive the apex domain from $KioskURL so allowlist also covers www/subs.
+$kioskHost = ([uri]$KioskURL).Host
+$apexParts = $kioskHost.Split('.')
+if ($apexParts.Count -ge 2) {
+    $apexDomain = ($apexParts[-2..-1] -join '.')  # e.g. awbb.be
+} else {
+    $apexDomain = $kioskHost
+}
+
+$blocklistPath = "$edgePolicyPath\URLBlocklist"
+if (Test-Path $blocklistPath) { Remove-Item $blocklistPath -Recurse -Force }
+New-Item -Path $blocklistPath -Force | Out-Null
+Set-ItemProperty -Path $blocklistPath -Name "1" -Value "*" -Type String
+
+$allowlistPath = "$edgePolicyPath\URLAllowlist"
+if (Test-Path $allowlistPath) { Remove-Item $allowlistPath -Recurse -Force }
+New-Item -Path $allowlistPath -Force | Out-Null
+Set-ItemProperty -Path $allowlistPath -Name "1" -Value $KioskURL -Type String
+Set-ItemProperty -Path $allowlistPath -Name "2" -Value "https://$kioskHost/*" -Type String
+Set-ItemProperty -Path $allowlistPath -Name "3" -Value "https://*.$apexDomain/*" -Type String
+# edge:// pages used by the app shell (about/blank, settings kept blocked elsewhere)
+Set-ItemProperty -Path $allowlistPath -Name "4" -Value "about:blank" -Type String
+Write-Output "Configured URL allowlist for $kioskHost and *.$apexDomain (block *)"
 
 # ============================================================
 Write-Output ""
@@ -258,7 +295,8 @@ Write-Output "=== SETUP COMPLETE ==="
 Write-Output "Kiosk user:     $KioskUser"
 Write-Output "URL:            $KioskURL"
 Write-Output "Auto-login:     enabled"
-Write-Output "Edge kiosk:     configured (StartupBoost disabled)"
+Write-Output "Edge mode:      --app (persistent profile, passwords kept)"
+Write-Output "URL sandbox:    block * / allow $kioskHost + *.$apexDomain"
 Write-Output "Watchdog:       configured (10s interval)"
 Write-Output "Keyboard:       Win/Alt+Tab/context-menu disabled"
 Write-Output "Power:          never sleep/screen-off"
